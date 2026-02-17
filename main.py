@@ -85,8 +85,11 @@ async def check_completed(user_id):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    # Добавляем пользователя в базу
     await add_user(message.from_user.id)
-    await message.answer("привет сонечка любимая ✅ Ты в системе! С 1 по 20 число я буду напоминать тебе о таблетках.")
+    
+    # Отправляем сообщение с сердечками
+    await message.answer("Ты в системе! ❤️❤️❤️")
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):

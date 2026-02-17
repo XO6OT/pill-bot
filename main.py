@@ -180,6 +180,11 @@ async def main():
     scheduler.start()
     
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # --- ДОБАВЛЕННАЯ СТРОЧКА ---
+    await bot.send_message(ADMIN_ID, "👨‍💻 Бот успешно обновлен и запущен! База данных в норме.")
+    # ---------------------------
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

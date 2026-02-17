@@ -3,7 +3,6 @@ import logging
 import json
 import os
 from datetime import datetime
-import pytz
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
@@ -145,8 +144,9 @@ async def nagging_check():
     now = datetime.now()
     if not (1 <= now.day <= 20): return # Только 1-20 число
     
-    # Не кошмарим людей ночью (работаем с 9:00 до 23:00)
-    if not (9 <= now.hour < 23): return
+    # Не кошмарим людей ночью (работаем с 9:00 до 23:00 по твоему времени)
+    # Сервер отстает на 2 часа, поэтому здесь 7-21
+    if not (7 <= now.hour < 21): return
 
     date_key = now.strftime("%Y-%m-%d")
     data = load_db()
@@ -162,12 +162,10 @@ async def nagging_check():
 
 # --- ЗАПУСК ---
 async def main():
-    # Укажи свой город (Europe/Kaliningrad или Europe/Moscow)
-    timezone = pytz.timezone("Europe/Kaliningrad")
-
     # Настраиваем расписание
     # 1. Основное напоминание в 22:00 по твоему времени
-    scheduler.add_job(morning_reminder, "cron", hour=22, minute=0, timezone=timezone)
+    # Сервер отстает на 2 часа, поэтому ставим 20:00
+    scheduler.add_job(morning_reminder, "cron", hour=20, minute=0)
     
     # 2. Проверка должников каждые 10 минут
     scheduler.add_job(nagging_check, "interval", minutes=10)

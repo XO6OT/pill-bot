@@ -94,16 +94,19 @@ async def cmd_start(message: types.Message):
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
-    day = datetime.now().day
-    
-    if not (1 <= day <= 20):
-        await message.answer("Сегодня не отчетный день. Отдыхай!")
-        return
 
+    # Если уже отчитался сегодня — просто говорим об этом
     if await check_completed(user_id):
         await message.answer("Ты уже отчитался сегодня! 💊")
         return
 
+    # Админу подтверждение не нужно — сразу засчитываем
+    if user_id == ADMIN_ID:
+        await mark_completed(user_id)
+        await message.answer("✅ Зачтено! Напоминания на сегодня отключены (ты админ, тебе верим без проверки).")
+        return
+
+    # Для всех остальных — обычный поток с подтверждением админом
     await message.answer("📸 Фото принято! Ждем админа...")
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -144,9 +147,6 @@ async def admin_reject(callback: types.CallbackQuery):
 # --- ПЛАНИРОВЩИК ---
 
 async def morning_reminder():
-    now = datetime.now()
-    if not (1 <= now.day <= 20): return
-
     users = await get_all_users()
     for user_id in users:
         try:
@@ -155,8 +155,6 @@ async def morning_reminder():
 
 async def nagging_check():
     now = datetime.now()
-    if not (1 <= now.day <= 20): return
-    
     # Внимание! Серверное время.
     # Если ты хочешь напоминать с 22:00 до 01:00 по ТВОЕМУ времени
     # (а сервер отстает на 2 часа), то пишем с 20:00 до 23:00

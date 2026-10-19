@@ -12,10 +12,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # --- КОНФИГУРАЦИЯ ---
 # Railway сам подставит сюда пароль от базы
 DATABASE_URL = os.getenv("DATABASE_URL") 
-BOT_TOKEN = "8514223980:AAE1FBB766X8H3MiG-YYFWjqgy3-k9f2xv0"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.08.25-snooze-undo"
-UPDATE_DESCRIPTION = "добавлена отмена отсрочки напоминаний"
+APP_VERSION = "2026.10.19-study-reminder"
+UPDATE_DESCRIPTION = "ежедневное напоминание об учёбе в 11:30 по Калининграду"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -304,6 +304,15 @@ async def admin_reject(callback: types.CallbackQuery):
 
 # --- ПЛАНИРОВЩИК ---
 
+async def study_reminder():
+    """Ежедневное напоминание всем пользователям, без отчёта и кнопок."""
+    users = await pool.fetch("SELECT user_id FROM users")
+    for user in users:
+        try:
+            await bot.send_message(user['user_id'], "📚 Пора изучить тему!")
+        except Exception:
+            logging.exception("Не удалось отправить напоминание об учёбе")
+
 async def morning_reminder():
     now = datetime.now()
     if not (1 <= now.day <= 20): return
@@ -341,6 +350,11 @@ async def nagging_check():
 # --- ЗАПУСК ---
 async def main():
     await init_db() # Подключаемся к БД
+
+    scheduler.add_job(
+        study_reminder, "cron", hour=11, minute=30,
+        timezone=LOCAL_TIMEZONE, id="daily_study_reminder"
+    )
     
     # Часовой пояс не нужен, если мы просто сдвигаем часы вручную (hour=20 -> 22:00)
     scheduler.add_job(morning_reminder, "cron", hour=20, minute=0)

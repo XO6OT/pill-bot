@@ -14,8 +14,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.10.19-study-reminder"
-UPDATE_DESCRIPTION = "ежедневное напоминание об учёбе в 11:30 по Калининграду"
+APP_VERSION = "2026.10.21-daily-reminders"
+UPDATE_DESCRIPTION = "напоминания о таблетках каждый день; учёба ежедневно в 11:30"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -255,11 +255,6 @@ async def resume_from_button(callback: types.CallbackQuery):
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
-    day = datetime.now().day
-    
-    if not (1 <= day <= 20):
-        await message.answer("Сегодня не отчетный день. Отдыхай!")
-        return
 
     if await check_completed(user_id):
         await message.answer("Ты уже отчитался сегодня! 💊")
@@ -314,9 +309,6 @@ async def study_reminder():
             logging.exception("Не удалось отправить напоминание об учёбе")
 
 async def morning_reminder():
-    now = datetime.now()
-    if not (1 <= now.day <= 20): return
-
     users = await get_users_for_reminders()
     for user_id in users:
         try:
@@ -328,13 +320,9 @@ async def morning_reminder():
         except: pass
 
 async def nagging_check():
-    now = datetime.now()
-    if not (1 <= now.day <= 20): return
-    
-    # Внимание! Серверное время.
-    # Если ты хочешь напоминать с 22:00 до 01:00 по ТВОЕМУ времени
-    # (а сервер отстает на 2 часа), то пишем с 20:00 до 23:00
-    if not (20 <= now.hour < 23): return
+    now = datetime.now(LOCAL_TIMEZONE)
+    # Напоминаем с 22:00 до 01:00 по Калининграду.
+    if not (now.hour >= 22 or now.hour < 1): return
 
     users = await get_users_for_reminders()
     for user_id in users:
@@ -356,8 +344,10 @@ async def main():
         timezone=LOCAL_TIMEZONE, id="daily_study_reminder"
     )
     
-    # Часовой пояс не нужен, если мы просто сдвигаем часы вручную (hour=20 -> 22:00)
-    scheduler.add_job(morning_reminder, "cron", hour=20, minute=0)
+    scheduler.add_job(
+        morning_reminder, "cron", hour=22, minute=0,
+        timezone=LOCAL_TIMEZONE, id="daily_pill_reminder"
+    )
     scheduler.add_job(nagging_check, "interval", minutes=10)
     
     scheduler.start()

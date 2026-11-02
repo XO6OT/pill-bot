@@ -82,7 +82,7 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
 
         text = self.send_message.await_args.args[1]
         self.assertNotIn("Доброе утро", text)
-        self.assertIn("Пришли фото упаковки", text)
+        self.assertEqual(text, "Люблю тебя котик, пришли фото ❤️❤️❤️")
 
     async def test_delete_user_removes_history_and_user(self):
         main.pool.execute.side_effect = ["DELETE 3", "DELETE 1"]

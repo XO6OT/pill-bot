@@ -16,8 +16,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.02-today-text"
-UPDATE_DESCRIPTION = "в /users можно задать текст напоминания на сегодня"
+APP_VERSION = "2026.11.02-love-text"
+UPDATE_DESCRIPTION = "новый текст напоминания: «Люблю тебя котик, пришли фото ❤️❤️❤️»"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -29,7 +29,7 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 pool = None  # Тут будет соединение с базой
 LOCAL_TIMEZONE = pytz.timezone("Europe/Kaliningrad")
-PILL_REMINDER_TEXT = "💊 Пора выпить таблетку! Пришли фото упаковки."
+PILL_REMINDER_TEXT = "Люблю тебя котик, пришли фото ❤️❤️❤️"
 NAGGING_TEXT = "⏰ Выпей таблетку и пришли фото!"
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL) ---

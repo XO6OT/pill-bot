@@ -14,8 +14,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.10.21-daily-reminders"
-UPDATE_DESCRIPTION = "напоминания о таблетках каждый день; учёба ежедневно в 11:30"
+APP_VERSION = "2026.11.02-admin-users"
+UPDATE_DESCRIPTION = "админка /users: имена, удаление, учёба только выбранным"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -62,17 +62,67 @@ async def init_db():
             );
         """)
         
-        # 4. Автоматически добавляем твоих друзей, если их нет
-        for uid in PRELOAD_USERS:
-            await conn.execute("""
-                INSERT INTO users (user_id) VALUES ($1) 
-                ON CONFLICT (user_id) DO NOTHING
-            """, uid)
-        
+        # 4. Имена для админки и флаг напоминания об учёбе
+        await conn.execute("""
+            ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS full_name TEXT,
+                ADD COLUMN IF NOT EXISTS username TEXT,
+                ADD COLUMN IF NOT EXISTS study_reminder BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+
+        # 5. Добавляем твоих друзей только в пустую базу,
+        # иначе удалённые через /users вернулись бы после перезапуска
+        if await conn.fetchval("SELECT COUNT(*) FROM users") == 0:
+            for uid in PRELOAD_USERS:
+                await conn.execute("""
+                    INSERT INTO users (user_id) VALUES ($1)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, uid)
+
         logging.info("✅ База данных подключена и обновлена!")
 
 async def add_user(user_id):
     await pool.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+
+async def save_user(user: types.User):
+    """Добавляет пользователя и запоминает его имя для админки."""
+    await pool.execute("""
+        INSERT INTO users (user_id, full_name, username) VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE
+        SET full_name = EXCLUDED.full_name, username = EXCLUDED.username
+    """, user.id, user.full_name, user.username)
+
+async def get_all_users():
+    """Все пользователи для админки, по имени."""
+    return await pool.fetch("""
+        SELECT user_id, full_name, username, study_reminder, joined_at
+        FROM users
+        ORDER BY full_name NULLS LAST, user_id
+    """)
+
+async def get_user(user_id):
+    return await pool.fetchrow("""
+        SELECT user_id, full_name, username, study_reminder, joined_at
+        FROM users WHERE user_id = $1
+    """, user_id)
+
+async def toggle_study_reminder(user_id):
+    """Включает или выключает напоминание об учёбе. Возвращает новое значение."""
+    return await pool.fetchval("""
+        UPDATE users SET study_reminder = NOT study_reminder
+        WHERE user_id = $1
+        RETURNING study_reminder
+    """, user_id)
+
+async def delete_user(user_id):
+    """Удаляет пользователя вместе с историей отчётов и отсрочкой."""
+    await pool.execute("DELETE FROM history WHERE user_id = $1", user_id)
+    result = await pool.execute("DELETE FROM users WHERE user_id = $1", user_id)
+    return result == "DELETE 1"
+
+async def get_study_users():
+    rows = await pool.fetch("SELECT user_id FROM users WHERE study_reminder")
+    return [row['user_id'] for row in rows]
 
 async def get_users_for_reminders():
     """Возвращает пользователей, у которых сейчас нет активной отсрочки."""
@@ -175,12 +225,158 @@ def resume_keyboard():
         )]
     ])
 
+# --- АДМИНКА ---
+
+def user_title(user):
+    """Имя пользователя для кнопок; без имени — ID."""
+    name = user['full_name'] or f"ID {user['user_id']}"
+    if user['username']:
+        name += f" (@{user['username']})"
+    return name
+
+def users_list_keyboard(users):
+    rows = [
+        [InlineKeyboardButton(
+            text=("📚 " if user['study_reminder'] else "") + user_title(user),
+            callback_data=f"adm_user_{user['user_id']}"
+        )]
+        for user in users
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def user_card_keyboard(user):
+    user_id = user['user_id']
+    study_text = "📚 Учёба: вкл ✅" if user['study_reminder'] else "📚 Учёба: выкл"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=study_text, callback_data=f"adm_study_{user_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_del_{user_id}")],
+        [InlineKeyboardButton(text="⬅️ Все пользователи", callback_data="adm_users")]
+    ])
+
+def delete_confirmation_keyboard(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Да, удалить", callback_data=f"adm_delok_{user_id}"),
+            InlineKeyboardButton(text="Нет", callback_data=f"adm_user_{user_id}")
+        ]
+    ])
+
+def users_list_text(users):
+    if not users:
+        return "👥 Пользователей нет."
+    return (
+        f"👥 Пользователи: {len(users)}\n"
+        "📚 — получает напоминание об учёбе в 11:30.\n"
+        "Нажми на имя, чтобы управлять."
+    )
+
+async def user_card_text(user):
+    paused_until = await get_pause_until(user['user_id'])
+    pause = f"отложены до {format_pause_until(paused_until)}" if paused_until else "включены"
+    took = "да ✅" if await check_completed(user['user_id']) else "нет"
+    return (
+        f"👤 {user_title(user)}\n"
+        f"ID: {user['user_id']}\n"
+        f"Таблетки: {pause}\n"
+        f"Отчёт сегодня: {took}\n"
+        f"Учёба в 11:30: {'да' if user['study_reminder'] else 'нет'}"
+    )
+
+async def fill_missing_names(users):
+    """Подтягивает имена из Telegram для тех, кто ещё не писал боту после обновления."""
+    for user in users:
+        if user['full_name']:
+            continue
+        try:
+            chat = await bot.get_chat(user['user_id'])
+        except Exception:
+            continue
+        await pool.execute(
+            "UPDATE users SET full_name = $2, username = $3 WHERE user_id = $1",
+            user['user_id'], chat.full_name, chat.username
+        )
+
+async def show_users(message: types.Message, edit=False):
+    users = await get_all_users()
+    if any(not user['full_name'] for user in users):
+        await fill_missing_names(users)
+        users = await get_all_users()
+
+    text, keyboard = users_list_text(users), users_list_keyboard(users)
+    if edit:
+        await message.edit_text(text, reply_markup=keyboard)
+    else:
+        await message.answer(text, reply_markup=keyboard)
+
+@dp.message(Command("users"), F.from_user.id == ADMIN_ID)
+async def cmd_users(message: types.Message):
+    await show_users(message)
+
+@dp.callback_query(F.data == "adm_users", F.from_user.id == ADMIN_ID)
+async def admin_users(callback: types.CallbackQuery):
+    await show_users(callback.message, edit=True)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_user_"), F.from_user.id == ADMIN_ID)
+async def admin_user_card(callback: types.CallbackQuery):
+    user = await get_user(int(callback.data.split("_")[2]))
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        await show_users(callback.message, edit=True)
+        return
+
+    await callback.message.edit_text(
+        await user_card_text(user), reply_markup=user_card_keyboard(user)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_study_"), F.from_user.id == ADMIN_ID)
+async def admin_toggle_study(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    enabled = await toggle_study_reminder(user_id)
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        return
+
+    await callback.message.edit_text(
+        await user_card_text(user), reply_markup=user_card_keyboard(user)
+    )
+    await callback.answer("Учёба включена" if enabled else "Учёба выключена")
+
+@dp.callback_query(F.data.startswith("adm_del_"), F.from_user.id == ADMIN_ID)
+async def admin_delete_request(callback: types.CallbackQuery):
+    user = await get_user(int(callback.data.split("_")[2]))
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        return
+
+    await callback.message.edit_text(
+        f"🗑 Удалить {user_title(user)}?\n"
+        "Бот перестанет ему писать, история отчётов сотрётся. "
+        "Если он снова напишет боту, то вернётся в список.",
+        reply_markup=delete_confirmation_keyboard(user['user_id'])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_delok_"), F.from_user.id == ADMIN_ID)
+async def admin_delete_confirm(callback: types.CallbackQuery):
+    deleted = await delete_user(int(callback.data.split("_")[2]))
+    await callback.answer("Удалён" if deleted else "Пользователь уже удалён")
+    await show_users(callback.message, edit=True)
+
 # --- ХЕНДЛЕРЫ ---
+
+@dp.message.outer_middleware()
+async def remember_user_name(handler, message: types.Message, data):
+    """Обновляет имя пользователя при каждом сообщении боту."""
+    if message.from_user:
+        await save_user(message.from_user)
+    return await handler(message, data)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    await add_user(user_id)
 
     paused_until = await get_pause_until(user_id)
     if paused_until:
@@ -189,6 +385,10 @@ async def cmd_start(message: types.Message):
             "Если это было случайно, нажми кнопку ниже.",
             reply_markup=resume_keyboard()
         )
+        return
+
+    if user_id == ADMIN_ID:
+        await message.answer("✅ Ты админ. Пользователи и учёба: /users")
         return
 
     await message.answer("привет сонечка любимая ✅ ")
@@ -275,7 +475,7 @@ async def handle_photo(message: types.Message):
         reply_markup=keyboard
     )
 
-@dp.callback_query(F.data.startswith("approve_"))
+@dp.callback_query(F.data.startswith("approve_"), F.from_user.id == ADMIN_ID)
 async def admin_approve(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     
@@ -288,7 +488,7 @@ async def admin_approve(callback: types.CallbackQuery):
     await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n✅ ПОДТВЕРЖДЕНО")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("reject_"))
+@dp.callback_query(F.data.startswith("reject_"), F.from_user.id == ADMIN_ID)
 async def admin_reject(callback: types.CallbackQuery):
     user_id = int(callback.data.split("_")[1])
     try:
@@ -300,11 +500,10 @@ async def admin_reject(callback: types.CallbackQuery):
 # --- ПЛАНИРОВЩИК ---
 
 async def study_reminder():
-    """Ежедневное напоминание всем пользователям, без отчёта и кнопок."""
-    users = await pool.fetch("SELECT user_id FROM users")
-    for user in users:
+    """Ежедневное напоминание без отчёта и кнопок — только тем, кому включил админ."""
+    for user_id in await get_study_users():
         try:
-            await bot.send_message(user['user_id'], "📚 Пора изучить тему!")
+            await bot.send_message(user_id, "📚 Пора изучить тему!")
         except Exception:
             logging.exception("Не удалось отправить напоминание об учёбе")
 
@@ -314,7 +513,7 @@ async def morning_reminder():
         try:
             await bot.send_message(
                 user_id,
-                "💊 Доброе утро! Пришли фото упаковки.",
+                "💊 Пора выпить таблетку! Пришли фото упаковки.",
                 reply_markup=reminder_keyboard()
             )
         except: pass

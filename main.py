@@ -6,6 +6,8 @@ import pytz
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -14,8 +16,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.02-admin-users"
-UPDATE_DESCRIPTION = "админка /users: имена, удаление, учёба только выбранным"
+APP_VERSION = "2026.11.02-today-text"
+UPDATE_DESCRIPTION = "в /users можно задать текст напоминания на сегодня"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -27,6 +29,8 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 pool = None  # Тут будет соединение с базой
 LOCAL_TIMEZONE = pytz.timezone("Europe/Kaliningrad")
+PILL_REMINDER_TEXT = "💊 Пора выпить таблетку! Пришли фото упаковки."
+NAGGING_TEXT = "⏰ Выпей таблетку и пришли фото!"
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL) ---
 
@@ -67,7 +71,9 @@ async def init_db():
             ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS full_name TEXT,
                 ADD COLUMN IF NOT EXISTS username TEXT,
-                ADD COLUMN IF NOT EXISTS study_reminder BOOLEAN NOT NULL DEFAULT FALSE;
+                ADD COLUMN IF NOT EXISTS study_reminder BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS custom_text TEXT,
+                ADD COLUMN IF NOT EXISTS custom_text_date DATE;
         """)
 
         # 5. Добавляем твоих друзей только в пустую базу,
@@ -119,6 +125,29 @@ async def delete_user(user_id):
     await pool.execute("DELETE FROM history WHERE user_id = $1", user_id)
     result = await pool.execute("DELETE FROM users WHERE user_id = $1", user_id)
     return result == "DELETE 1"
+
+def today_local():
+    return datetime.now(LOCAL_TIMEZONE).date()
+
+async def set_today_text(user_id, text):
+    """Текст таблеточных напоминаний только на сегодняшний день по Калининграду."""
+    await pool.execute(
+        "UPDATE users SET custom_text = $2, custom_text_date = $3 WHERE user_id = $1",
+        user_id, text, today_local()
+    )
+
+async def clear_today_text(user_id):
+    await pool.execute(
+        "UPDATE users SET custom_text = NULL, custom_text_date = NULL WHERE user_id = $1",
+        user_id
+    )
+
+async def get_today_text(user_id):
+    """Текст админа на сегодня или None, если он не задан или устарел."""
+    return await pool.fetchval(
+        "SELECT custom_text FROM users WHERE user_id = $1 AND custom_text_date = $2",
+        user_id, today_local()
+    )
 
 async def get_study_users():
     rows = await pool.fetch("SELECT user_id FROM users WHERE study_reminder")
@@ -244,11 +273,20 @@ def users_list_keyboard(users):
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def user_card_keyboard(user):
+class AdminText(StatesGroup):
+    waiting = State()
+
+def user_card_keyboard(user, has_today_text=False):
     user_id = user['user_id']
     study_text = "📚 Учёба: вкл ✅" if user['study_reminder'] else "📚 Учёба: выкл"
+    text_row = [InlineKeyboardButton(text="✏️ Текст на сегодня", callback_data=f"adm_text_{user_id}")]
+    if has_today_text:
+        text_row.append(
+            InlineKeyboardButton(text="↩️ Обычный текст", callback_data=f"adm_textreset_{user_id}")
+        )
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=study_text, callback_data=f"adm_study_{user_id}")],
+        text_row,
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_del_{user_id}")],
         [InlineKeyboardButton(text="⬅️ Все пользователи", callback_data="adm_users")]
     ])
@@ -270,7 +308,7 @@ def users_list_text(users):
         "Нажми на имя, чтобы управлять."
     )
 
-async def user_card_text(user):
+async def user_card_text(user, today_text=None):
     paused_until = await get_pause_until(user['user_id'])
     pause = f"отложены до {format_pause_until(paused_until)}" if paused_until else "включены"
     took = "да ✅" if await check_completed(user['user_id']) else "нет"
@@ -279,7 +317,15 @@ async def user_card_text(user):
         f"ID: {user['user_id']}\n"
         f"Таблетки: {pause}\n"
         f"Отчёт сегодня: {took}\n"
-        f"Учёба в 11:30: {'да' if user['study_reminder'] else 'нет'}"
+        f"Учёба в 11:30: {'да' if user['study_reminder'] else 'нет'}\n"
+        f"Текст напоминаний сегодня: {today_text or 'обычный'}"
+    )
+
+async def edit_user_card(message: types.Message, user):
+    today_text = await get_today_text(user['user_id'])
+    await message.edit_text(
+        await user_card_text(user, today_text),
+        reply_markup=user_card_keyboard(user, has_today_text=bool(today_text))
     )
 
 async def fill_missing_names(users):
@@ -309,7 +355,8 @@ async def show_users(message: types.Message, edit=False):
         await message.answer(text, reply_markup=keyboard)
 
 @dp.message(Command("users"), F.from_user.id == ADMIN_ID)
-async def cmd_users(message: types.Message):
+async def cmd_users(message: types.Message, state: FSMContext):
+    await state.clear()
     await show_users(message)
 
 @dp.callback_query(F.data == "adm_users", F.from_user.id == ADMIN_ID)
@@ -318,16 +365,15 @@ async def admin_users(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("adm_user_"), F.from_user.id == ADMIN_ID)
-async def admin_user_card(callback: types.CallbackQuery):
+async def admin_user_card(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     user = await get_user(int(callback.data.split("_")[2]))
     if not user:
         await callback.answer("Пользователь уже удалён")
         await show_users(callback.message, edit=True)
         return
 
-    await callback.message.edit_text(
-        await user_card_text(user), reply_markup=user_card_keyboard(user)
-    )
+    await edit_user_card(callback.message, user)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("adm_study_"), F.from_user.id == ADMIN_ID)
@@ -339,10 +385,53 @@ async def admin_toggle_study(callback: types.CallbackQuery):
         await callback.answer("Пользователь уже удалён")
         return
 
-    await callback.message.edit_text(
-        await user_card_text(user), reply_markup=user_card_keyboard(user)
-    )
+    await edit_user_card(callback.message, user)
     await callback.answer("Учёба включена" if enabled else "Учёба выключена")
+
+@dp.callback_query(F.data.startswith("adm_text_"), F.from_user.id == ADMIN_ID)
+async def admin_text_request(callback: types.CallbackQuery, state: FSMContext):
+    user = await get_user(int(callback.data.split("_")[2]))
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        return
+
+    await state.set_state(AdminText.waiting)
+    await state.update_data(user_id=user['user_id'])
+    await callback.message.edit_text(
+        f"✏️ Пришли текст для {user_title(user)}.\n"
+        f"Сегодня ({today_local().strftime('%d.%m')}) таблеточные напоминания придут "
+        f"с ним вместо обычного «{PILL_REMINDER_TEXT}». Завтра текст снова станет обычным.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data=f"adm_user_{user['user_id']}")]
+        ])
+    )
+    await callback.answer()
+
+@dp.message(AdminText.waiting, F.from_user.id == ADMIN_ID, F.text, ~F.text.startswith("/"))
+async def admin_text_save(message: types.Message, state: FSMContext):
+    user_id = (await state.get_data())['user_id']
+    await state.clear()
+    user = await get_user(user_id)
+    if not user:
+        await message.answer("Пользователь уже удалён.")
+        return
+
+    await set_today_text(user_id, message.text)
+    await message.answer(
+        f"✅ Сегодня {user_title(user)} получит:\n{message.text}",
+        reply_markup=user_card_keyboard(user, has_today_text=True)
+    )
+
+@dp.callback_query(F.data.startswith("adm_textreset_"), F.from_user.id == ADMIN_ID)
+async def admin_text_reset(callback: types.CallbackQuery):
+    user = await get_user(int(callback.data.split("_")[2]))
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        return
+
+    await clear_today_text(user['user_id'])
+    await edit_user_card(callback.message, user)
+    await callback.answer("Текст снова обычный")
 
 @dp.callback_query(F.data.startswith("adm_del_"), F.from_user.id == ADMIN_ID)
 async def admin_delete_request(callback: types.CallbackQuery):
@@ -513,7 +602,7 @@ async def morning_reminder():
         try:
             await bot.send_message(
                 user_id,
-                "💊 Пора выпить таблетку! Пришли фото упаковки.",
+                await get_today_text(user_id) or PILL_REMINDER_TEXT,
                 reply_markup=reminder_keyboard()
             )
         except: pass
@@ -529,7 +618,7 @@ async def nagging_check():
             try:
                 await bot.send_message(
                     user_id,
-                    "⏰ Выпей таблетку и пришли фото!",
+                    await get_today_text(user_id) or NAGGING_TEXT,
                     reply_markup=reminder_keyboard()
                 )
             except: pass

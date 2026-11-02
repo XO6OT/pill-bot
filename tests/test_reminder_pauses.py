@@ -77,6 +77,7 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pill_reminder_has_no_good_morning(self):
         main.pool.fetch.return_value = [{"user_id": 7}]
+        main.pool.fetchval.return_value = None
         await main.morning_reminder()
 
         text = self.send_message.await_args.args[1]
@@ -108,7 +109,7 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [button.callback_data for button in buttons],
-            ["adm_study_5", "adm_del_5", "adm_users"]
+            ["adm_study_5", "adm_text_5", "adm_del_5", "adm_users"]
         )
         self.assertIn("вкл", buttons[0].text)
 
@@ -123,6 +124,39 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].text, "📚 Соня (@sonya)")
         self.assertEqual(buttons[1].text, "ID 6")
         self.assertEqual(buttons[1].callback_data, "adm_user_6")
+
+
+    async def test_today_text_replaces_pill_reminder(self):
+        main.pool.fetch.return_value = [{"user_id": 7}]
+        main.pool.fetchval.return_value = "Солнце, не забудь таблетку 💛"
+
+        await main.morning_reminder()
+
+        self.assertEqual(self.send_message.await_args.args[1], "Солнце, не забудь таблетку 💛")
+        query, user_id, day = main.pool.fetchval.await_args.args
+        self.assertIn("custom_text_date = $2", query)
+        self.assertEqual((user_id, day), (7, main.today_local()))
+
+    async def test_today_text_replaces_nagging(self):
+        main.pool.fetch.return_value = [{"user_id": 7}]
+        main.pool.fetchrow.return_value = None  # отчёта сегодня нет
+        main.pool.fetchval.return_value = "Мой текст"
+        night = datetime(2026, 11, 2, 22, 30, tzinfo=main.LOCAL_TIMEZONE)
+
+        with patch.object(main, "datetime") as fake_datetime:
+            fake_datetime.now.return_value = night
+            await main.nagging_check()
+
+        self.assertEqual(self.send_message.await_args.args[1], "Мой текст")
+
+    def test_user_card_has_today_text_buttons(self):
+        user = {"user_id": 5, "full_name": "Соня", "username": None, "study_reminder": False}
+
+        plain = main.user_card_keyboard(user).inline_keyboard[1]
+        custom = main.user_card_keyboard(user, has_today_text=True).inline_keyboard[1]
+
+        self.assertEqual([b.callback_data for b in plain], ["adm_text_5"])
+        self.assertEqual([b.callback_data for b in custom], ["adm_text_5", "adm_textreset_5"])
 
 
 if __name__ == "__main__":

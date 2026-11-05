@@ -11,15 +11,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from reminder_parser import ReminderError, looks_like_reminder, parse_reminder, with_reminder_text
+from reminder_parser import (
+    HELP_EXAMPLES, ReminderError, describe_when, looks_like_reminder, parse_reminder, with_reminder_text,
+)
 
 # --- КОНФИГУРАЦИЯ ---
 # Railway сам подставит сюда пароль от базы
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.05-own-reminders"
-UPDATE_DESCRIPTION = "свои напоминания: «напомни мне в 12:30 о …», список /reminders"
+APP_VERSION = "2026.11.05-flexible-reminders"
+UPDATE_DESCRIPTION = "напоминания понимают слова, дни недели, даты и «каждый понедельник»"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -77,6 +79,11 @@ async def init_db():
                 remind_at TIMESTAMPTZ NOT NULL,
                 daily BOOLEAN NOT NULL DEFAULT FALSE
             );
+        """)
+        # повтор в днях: 0 — один раз, 1 — каждый день, 7 — каждую неделю
+        await conn.execute("""
+            ALTER TABLE user_reminders ADD COLUMN IF NOT EXISTS repeat_days INT NOT NULL DEFAULT 0;
+            UPDATE user_reminders SET repeat_days = 1 WHERE daily AND repeat_days = 0;
         """)
 
         # 5. Имена для админки и флаг напоминания об учёбе
@@ -170,13 +177,13 @@ async def add_own_reminder(user_id, parsed):
     if count >= MAX_OWN_REMINDERS:
         return None
     return await pool.fetchval("""
-        INSERT INTO user_reminders (user_id, text, remind_at, daily)
-        VALUES ($1, $2, $3, $4) RETURNING id
-    """, user_id, parsed.text, parsed.remind_at, parsed.daily)
+        INSERT INTO user_reminders (user_id, text, remind_at, daily, repeat_days)
+        VALUES ($1, $2, $3, $4, $5) RETURNING id
+    """, user_id, parsed.text, parsed.remind_at, parsed.repeat_days == 1, parsed.repeat_days)
 
 async def get_own_reminders(user_id):
     return await pool.fetch("""
-        SELECT id, text, remind_at, daily FROM user_reminders
+        SELECT id, text, remind_at, repeat_days FROM user_reminders
         WHERE user_id = $1 ORDER BY remind_at
     """, user_id)
 
@@ -251,16 +258,13 @@ def format_pause_until(paused_until):
     local_time = paused_until.astimezone(LOCAL_TIMEZONE)
     return local_time.strftime("%d.%m.%Y в %H:%M")
 
-def format_remind_at(remind_at, daily=False):
-    local = remind_at.astimezone(LOCAL_TIMEZONE)
-    if daily:
-        return f"каждый день в {local.strftime('%H:%M')}"
-    return local.strftime("%d.%m в %H:%M")
+def format_remind_at(remind_at, repeat_days=0):
+    return describe_when(remind_at, repeat_days, datetime.now(LOCAL_TIMEZONE))
 
 def own_reminders_keyboard(reminders):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"🗑 {format_remind_at(r['remind_at'], r['daily'])} — {r['text'][:30]}",
+            text=f"🗑 {format_remind_at(r['remind_at'], r['repeat_days'])} — {r['text'][:30]}",
             callback_data=f"rem_del_{r['id']}"
         )]
         for r in reminders
@@ -642,12 +646,8 @@ async def admin_reject(callback: types.CallbackQuery):
 
 OWN_REMINDERS_HELP = (
     "Можно ставить себе напоминания обычным сообщением, например:\n"
-    "• напомни мне в 12:30 о звонке\n"
-    "• в 18:00 напомни купить хлеб\n"
-    "• завтра в 9 напомни про врача\n"
-    "• через 20 минут напомни выпить воды\n"
-    "• каждый день в 8:00 напомни про витамины\n"
-    "Список и удаление: /reminders"
+    + HELP_EXAMPLES
+    + "\nСписок и удаление: /reminders"
 )
 
 @dp.message(F.text, ~F.text.startswith("/"), F.text.func(looks_like_reminder))
@@ -666,7 +666,7 @@ async def own_reminder_create(message: types.Message):
         return
 
     await message.answer(
-        with_reminder_text(f"✅ Напомню {format_remind_at(parsed.remind_at, parsed.daily)}", parsed.text),
+        with_reminder_text(f"✅ Напомню {format_remind_at(parsed.remind_at, parsed.repeat_days)}", parsed.text),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отменить", callback_data=f"rem_del_{reminder_id}")]
         ])
@@ -701,7 +701,7 @@ async def own_reminder_delete(callback: types.CallbackQuery):
 async def send_own_reminders():
     """Раз в минуту отправляет наступившие напоминания пользователей."""
     due = await pool.fetch("""
-        SELECT id, user_id, text, daily FROM user_reminders
+        SELECT id, user_id, text, repeat_days FROM user_reminders
         WHERE remind_at <= NOW() ORDER BY remind_at
     """)
     for reminder in due:
@@ -710,12 +710,13 @@ async def send_own_reminders():
         except Exception:
             logging.exception("Не удалось отправить своё напоминание")
 
-        if reminder['daily']:
-            # следующий день, даже если бот лежал несколько суток
+        if reminder['repeat_days']:
+            # следующий повтор, даже если бот лежал несколько суток
             await pool.execute("""
                 UPDATE user_reminders
-                SET remind_at = remind_at
-                    + (FLOOR(EXTRACT(EPOCH FROM NOW() - remind_at) / 86400) + 1) * INTERVAL '1 day'
+                SET remind_at = remind_at + (
+                    FLOOR(EXTRACT(EPOCH FROM NOW() - remind_at) / (86400 * repeat_days)) + 1
+                ) * repeat_days * INTERVAL '1 day'
                 WHERE id = $1
             """, reminder['id'])
         else:

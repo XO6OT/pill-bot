@@ -161,8 +161,8 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_due_own_reminders_are_sent_and_cleaned_up(self):
         main.pool.fetch.return_value = [
-            {"id": 1, "user_id": 7, "text": "Позвонить маме", "daily": False},
-            {"id": 2, "user_id": 7, "text": "Витамины", "daily": True},
+            {"id": 1, "user_id": 7, "text": "Позвонить маме", "repeat_days": 0},
+            {"id": 2, "user_id": 7, "text": "Витамины", "repeat_days": 7},
         ]
 
         await main.send_own_reminders()

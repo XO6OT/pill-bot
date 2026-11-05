@@ -159,5 +159,27 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([b.callback_data for b in custom], ["adm_text_5", "adm_textreset_5"])
 
 
+    async def test_due_own_reminders_are_sent_and_cleaned_up(self):
+        main.pool.fetch.return_value = [
+            {"id": 1, "user_id": 7, "text": "Позвонить маме", "daily": False},
+            {"id": 2, "user_id": 7, "text": "Витамины", "daily": True},
+        ]
+
+        await main.send_own_reminders()
+
+        sent = [call.args for call in self.send_message.await_args_list]
+        self.assertEqual(sent, [(7, "⏰ Напоминаю: Позвонить маме"), (7, "⏰ Напоминаю: Витамины")])
+        queries = [call.args for call in main.pool.execute.await_args_list]
+        self.assertIn("DELETE FROM user_reminders", queries[0][0])
+        self.assertEqual(queries[0][1], 1)
+        self.assertIn("INTERVAL '1 day'", queries[1][0])
+        self.assertEqual(queries[1][1], 2)
+
+    async def test_own_reminder_limit(self):
+        main.pool.fetchval.return_value = main.MAX_OWN_REMINDERS
+
+        self.assertIsNone(await main.add_own_reminder(7, object()))
+
+
 if __name__ == "__main__":
     unittest.main()

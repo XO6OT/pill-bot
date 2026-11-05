@@ -11,13 +11,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from reminder_parser import ReminderError, looks_like_reminder, parse_reminder, with_reminder_text
+
 # --- КОНФИГУРАЦИЯ ---
 # Railway сам подставит сюда пароль от базы
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.02-love-text"
-UPDATE_DESCRIPTION = "новый текст напоминания: «Люблю тебя котик, пришли фото ❤️❤️❤️»"
+APP_VERSION = "2026.11.05-own-reminders"
+UPDATE_DESCRIPTION = "свои напоминания: «напомни мне в 12:30 о …», список /reminders"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -66,7 +68,18 @@ async def init_db():
             );
         """)
         
-        # 4. Имена для админки и флаг напоминания об учёбе
+        # 4. Свои напоминания пользователей («напомни мне в 12:30 о …»)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_reminders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                remind_at TIMESTAMPTZ NOT NULL,
+                daily BOOLEAN NOT NULL DEFAULT FALSE
+            );
+        """)
+
+        # 5. Имена для админки и флаг напоминания об учёбе
         await conn.execute("""
             ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS full_name TEXT,
@@ -76,7 +89,7 @@ async def init_db():
                 ADD COLUMN IF NOT EXISTS custom_text_date DATE;
         """)
 
-        # 5. Добавляем твоих друзей только в пустую базу,
+        # 6. Добавляем твоих друзей только в пустую базу,
         # иначе удалённые через /users вернулись бы после перезапуска
         if await conn.fetchval("SELECT COUNT(*) FROM users") == 0:
             for uid in PRELOAD_USERS:
@@ -149,6 +162,30 @@ async def get_today_text(user_id):
         user_id, today_local()
     )
 
+MAX_OWN_REMINDERS = 30
+
+async def add_own_reminder(user_id, parsed):
+    """Сохраняет напоминание. Возвращает id или None, если их уже слишком много."""
+    count = await pool.fetchval("SELECT COUNT(*) FROM user_reminders WHERE user_id = $1", user_id)
+    if count >= MAX_OWN_REMINDERS:
+        return None
+    return await pool.fetchval("""
+        INSERT INTO user_reminders (user_id, text, remind_at, daily)
+        VALUES ($1, $2, $3, $4) RETURNING id
+    """, user_id, parsed.text, parsed.remind_at, parsed.daily)
+
+async def get_own_reminders(user_id):
+    return await pool.fetch("""
+        SELECT id, text, remind_at, daily FROM user_reminders
+        WHERE user_id = $1 ORDER BY remind_at
+    """, user_id)
+
+async def delete_own_reminder(reminder_id, user_id):
+    result = await pool.execute(
+        "DELETE FROM user_reminders WHERE id = $1 AND user_id = $2", reminder_id, user_id
+    )
+    return result == "DELETE 1"
+
 async def get_study_users():
     rows = await pool.fetch("SELECT user_id FROM users WHERE study_reminder")
     return [row['user_id'] for row in rows]
@@ -213,6 +250,21 @@ def format_pause_until(paused_until):
         paused_until = pytz.utc.localize(paused_until)
     local_time = paused_until.astimezone(LOCAL_TIMEZONE)
     return local_time.strftime("%d.%m.%Y в %H:%M")
+
+def format_remind_at(remind_at, daily=False):
+    local = remind_at.astimezone(LOCAL_TIMEZONE)
+    if daily:
+        return f"каждый день в {local.strftime('%H:%M')}"
+    return local.strftime("%d.%m в %H:%M")
+
+def own_reminders_keyboard(reminders):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🗑 {format_remind_at(r['remind_at'], r['daily'])} — {r['text'][:30]}",
+            callback_data=f"rem_del_{r['id']}"
+        )]
+        for r in reminders
+    ])
 
 def version_message(now=None):
     """Сообщение, по которому видно, что новая версия действительно запущена."""
@@ -480,7 +532,7 @@ async def cmd_start(message: types.Message):
         await message.answer("✅ Ты админ. Пользователи и учёба: /users")
         return
 
-    await message.answer("привет сонечка любимая ✅ ")
+    await message.answer("привет сонечка любимая ✅\n\n" + OWN_REMINDERS_HELP)
 
 @dp.message(Command("resume"))
 async def cmd_resume(message: types.Message):
@@ -586,6 +638,89 @@ async def admin_reject(callback: types.CallbackQuery):
     await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n❌ ОТКЛОНЕНО")
     await callback.answer()
 
+# --- СВОИ НАПОМИНАНИЯ ---
+
+OWN_REMINDERS_HELP = (
+    "Можно ставить себе напоминания обычным сообщением, например:\n"
+    "• напомни мне в 12:30 о звонке\n"
+    "• в 18:00 напомни купить хлеб\n"
+    "• завтра в 9 напомни про врача\n"
+    "• через 20 минут напомни выпить воды\n"
+    "• каждый день в 8:00 напомни про витамины\n"
+    "Список и удаление: /reminders"
+)
+
+@dp.message(F.text, ~F.text.startswith("/"), F.text.func(looks_like_reminder))
+async def own_reminder_create(message: types.Message):
+    try:
+        parsed = parse_reminder(message.text, datetime.now(LOCAL_TIMEZONE))
+    except ReminderError as error:
+        await message.answer(str(error))
+        return
+
+    reminder_id = await add_own_reminder(message.from_user.id, parsed)
+    if reminder_id is None:
+        await message.answer(
+            f"У тебя уже {MAX_OWN_REMINDERS} напоминаний. Удали ненужные в /reminders."
+        )
+        return
+
+    await message.answer(
+        with_reminder_text(f"✅ Напомню {format_remind_at(parsed.remind_at, parsed.daily)}", parsed.text),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить", callback_data=f"rem_del_{reminder_id}")]
+        ])
+    )
+
+@dp.message(Command("reminders"))
+async def cmd_reminders(message: types.Message):
+    reminders = await get_own_reminders(message.from_user.id)
+    if not reminders:
+        await message.answer("У тебя пока нет своих напоминаний.\n\n" + OWN_REMINDERS_HELP)
+        return
+
+    await message.answer(
+        "⏰ Твои напоминания. Нажми на ненужное, чтобы удалить:",
+        reply_markup=own_reminders_keyboard(reminders)
+    )
+
+@dp.callback_query(F.data.startswith("rem_del_"))
+async def own_reminder_delete(callback: types.CallbackQuery):
+    deleted = await delete_own_reminder(int(callback.data.split("_")[2]), callback.from_user.id)
+    reminders = await get_own_reminders(callback.from_user.id)
+    if callback.message:
+        if reminders:
+            await callback.message.edit_text(
+                "⏰ Твои напоминания. Нажми на ненужное, чтобы удалить:",
+                reply_markup=own_reminders_keyboard(reminders)
+            )
+        else:
+            await callback.message.edit_text("🗑 Напоминание удалено. Других нет.")
+    await callback.answer("Удалено" if deleted else "Уже удалено")
+
+async def send_own_reminders():
+    """Раз в минуту отправляет наступившие напоминания пользователей."""
+    due = await pool.fetch("""
+        SELECT id, user_id, text, daily FROM user_reminders
+        WHERE remind_at <= NOW() ORDER BY remind_at
+    """)
+    for reminder in due:
+        try:
+            await bot.send_message(reminder['user_id'], with_reminder_text("⏰ Напоминаю", reminder['text']))
+        except Exception:
+            logging.exception("Не удалось отправить своё напоминание")
+
+        if reminder['daily']:
+            # следующий день, даже если бот лежал несколько суток
+            await pool.execute("""
+                UPDATE user_reminders
+                SET remind_at = remind_at
+                    + (FLOOR(EXTRACT(EPOCH FROM NOW() - remind_at) / 86400) + 1) * INTERVAL '1 day'
+                WHERE id = $1
+            """, reminder['id'])
+        else:
+            await pool.execute("DELETE FROM user_reminders WHERE id = $1", reminder['id'])
+
 # --- ПЛАНИРОВЩИК ---
 
 async def study_reminder():
@@ -637,10 +772,15 @@ async def main():
         timezone=LOCAL_TIMEZONE, id="daily_pill_reminder"
     )
     scheduler.add_job(nagging_check, "interval", minutes=10)
+    scheduler.add_job(send_own_reminders, "cron", second=0, id="own_reminders")
     
     scheduler.start()
     
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_my_commands([
+        types.BotCommand(command="reminders", description="Мои напоминания"),
+        types.BotCommand(command="resume", description="Отменить отсрочку таблеток"),
+    ])
 
     try:
         await bot.send_message(ADMIN_ID, version_message())

@@ -39,9 +39,13 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
     async def test_paused_users_are_filtered_from_reminders(self):
         main.pool.fetch.return_value = [{"user_id": 1}, {"user_id": 2}]
 
-        self.assertEqual(await main.get_users_for_reminders(), [1, 2])
-        reminder_query = main.pool.fetch.await_args.args[0]
+        self.assertEqual(len(await main.get_users_for_reminders()), 2)
+        reminder_query, day = main.pool.fetch.await_args.args
         self.assertIn("paused_until > NOW()", reminder_query)
+        self.assertIn("users.pill_reminders", reminder_query)
+        self.assertIn("photo_pending_day IS DISTINCT FROM $1", reminder_query)
+        self.assertIn("history.date = $1", reminder_query)
+        self.assertEqual(day, main.pill_day())
 
     def test_pause_time_is_shown_in_local_timezone(self):
         paused_until = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
@@ -109,9 +113,13 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [button.callback_data for button in buttons],
-            ["adm_study_5", "adm_text_5", "adm_del_5", "adm_users"]
+            ["adm_pill_5", "adm_study_5", "adm_text_5", "adm_del_5", "adm_users"]
         )
-        self.assertIn("вкл", buttons[0].text)
+        self.assertIn("Таблетки: вкл", buttons[0].text)
+        self.assertIn("Учёба: вкл", buttons[1].text)
+
+        user["pill_reminders"] = False
+        self.assertIn("Таблетки: выкл", main.user_card_keyboard(user).inline_keyboard[0][0].text)
 
     def test_users_list_shows_names_and_study_mark(self):
         users = [
@@ -152,8 +160,8 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
     def test_user_card_has_today_text_buttons(self):
         user = {"user_id": 5, "full_name": "Соня", "username": None, "study_reminder": False}
 
-        plain = main.user_card_keyboard(user).inline_keyboard[1]
-        custom = main.user_card_keyboard(user, has_today_text=True).inline_keyboard[1]
+        plain = main.user_card_keyboard(user).inline_keyboard[2]
+        custom = main.user_card_keyboard(user, has_today_text=True).inline_keyboard[2]
 
         self.assertEqual([b.callback_data for b in plain], ["adm_text_5"])
         self.assertEqual([b.callback_data for b in custom], ["adm_text_5", "adm_textreset_5"])
@@ -179,6 +187,47 @@ class ReminderPauseTests(unittest.IsolatedAsyncioTestCase):
         main.pool.fetchval.return_value = main.MAX_OWN_REMINDERS
 
         self.assertIsNone(await main.add_own_reminder(7, object()))
+
+
+    def test_pill_day_runs_from_noon_to_noon(self):
+        tz = main.LOCAL_TIMEZONE
+        evening = tz.localize(datetime(2026, 11, 9, 22, 30))
+        after_midnight = tz.localize(datetime(2026, 11, 10, 0, 30))
+        next_afternoon = tz.localize(datetime(2026, 11, 10, 14, 0))
+
+        self.assertEqual(main.pill_day(evening), main.pill_day(after_midnight))
+        self.assertNotEqual(main.pill_day(evening), main.pill_day(next_afternoon))
+
+    async def test_new_pill_reminder_replaces_previous_message(self):
+        main.pool.fetch.return_value = [{"user_id": 7, "last_reminder_msg": 100}]
+        main.pool.fetchval.return_value = None
+        self.send_message.return_value.message_id = 101
+        night = datetime(2026, 11, 9, 22, 30, tzinfo=main.LOCAL_TIMEZONE)
+
+        with patch.object(main.bot, "delete_message", new_callable=AsyncMock) as delete_message, \
+                patch.object(main, "datetime") as fake_datetime:
+            fake_datetime.now.return_value = night
+            await main.nagging_check()
+
+        delete_message.assert_awaited_once_with(7, 100)
+        query, user_id, message_id = main.pool.execute.await_args.args
+        self.assertIn("last_reminder_msg = $2", query)
+        self.assertEqual((user_id, message_id), (7, 101))
+
+    def test_report_buttons_carry_the_pill_day(self):
+        self.assertEqual(
+            main.parse_report_callback("approve_42_20261109"), (42, datetime(2026, 11, 9).date())
+        )
+        self.assertEqual(main.parse_report_callback("reject_42"), (42, main.pill_day()))
+
+    async def test_approval_marks_the_day_from_the_button(self):
+        day = datetime(2026, 11, 9).date()
+
+        await main.mark_completed(42, day)
+
+        insert, clear = [call.args for call in main.pool.execute.await_args_list]
+        self.assertEqual(insert[1:], (42, day))
+        self.assertIn("photo_pending_day = NULL", clear[0])
 
 
 if __name__ == "__main__":

@@ -3,12 +3,12 @@ import logging
 import os
 import asyncpg
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from reminder_parser import (
@@ -20,8 +20,8 @@ from reminder_parser import (
 DATABASE_URL = os.getenv("DATABASE_URL") 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.05-flexible-reminders"
-UPDATE_DESCRIPTION = "напоминания понимают слова, дни недели, даты и «каждый понедельник»"
+APP_VERSION = "2026.11.09-bugfixes"
+UPDATE_DESCRIPTION = "таблетки можно выключить человеку в /users; одно напоминание в чате вместо пачки"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -93,7 +93,10 @@ async def init_db():
                 ADD COLUMN IF NOT EXISTS username TEXT,
                 ADD COLUMN IF NOT EXISTS study_reminder BOOLEAN NOT NULL DEFAULT FALSE,
                 ADD COLUMN IF NOT EXISTS custom_text TEXT,
-                ADD COLUMN IF NOT EXISTS custom_text_date DATE;
+                ADD COLUMN IF NOT EXISTS custom_text_date DATE,
+                ADD COLUMN IF NOT EXISTS pill_reminders BOOLEAN NOT NULL DEFAULT TRUE,
+                ADD COLUMN IF NOT EXISTS photo_pending_day DATE,
+                ADD COLUMN IF NOT EXISTS last_reminder_msg BIGINT;
         """)
 
         # 6. Добавляем твоих друзей только в пустую базу,
@@ -121,14 +124,14 @@ async def save_user(user: types.User):
 async def get_all_users():
     """Все пользователи для админки, по имени."""
     return await pool.fetch("""
-        SELECT user_id, full_name, username, study_reminder, joined_at
+        SELECT user_id, full_name, username, study_reminder, pill_reminders, joined_at
         FROM users
         ORDER BY full_name NULLS LAST, user_id
     """)
 
 async def get_user(user_id):
     return await pool.fetchrow("""
-        SELECT user_id, full_name, username, study_reminder, joined_at
+        SELECT user_id, full_name, username, study_reminder, pill_reminders, joined_at
         FROM users WHERE user_id = $1
     """, user_id)
 
@@ -140,14 +143,31 @@ async def toggle_study_reminder(user_id):
         RETURNING study_reminder
     """, user_id)
 
+async def toggle_pill_reminders(user_id):
+    """Включает или выключает таблеточные напоминания. Возвращает новое значение."""
+    return await pool.fetchval("""
+        UPDATE users SET pill_reminders = NOT pill_reminders
+        WHERE user_id = $1
+        RETURNING pill_reminders
+    """, user_id)
+
 async def delete_user(user_id):
     """Удаляет пользователя вместе с историей отчётов и отсрочкой."""
     await pool.execute("DELETE FROM history WHERE user_id = $1", user_id)
     result = await pool.execute("DELETE FROM users WHERE user_id = $1", user_id)
     return result == "DELETE 1"
 
+def pill_day(now=None):
+    """День приёма таблетки: с полудня до полудня по Калининграду.
+
+    Напоминания идут с 22:00 до 01:00, поэтому фото в 00:30 относится
+    ко вчерашнему вечеру, а не к следующему.
+    """
+    now = now or datetime.now(LOCAL_TIMEZONE)
+    return (now - timedelta(hours=12)).date()
+
 def today_local():
-    return datetime.now(LOCAL_TIMEZONE).date()
+    return pill_day()
 
 async def set_today_text(user_id, text):
     """Текст таблеточных напоминаний только на сегодняшний день по Калининграду."""
@@ -198,16 +218,21 @@ async def get_study_users():
     return [row['user_id'] for row in rows]
 
 async def get_users_for_reminders():
-    """Возвращает пользователей, у которых сейчас нет активной отсрочки."""
-    rows = await pool.fetch("""
-        SELECT users.user_id
+    """Кому сейчас нужно напомнить о таблетке: напоминания включены, нет отсрочки,
+    за этот день нет подтверждённого отчёта и фото не ждёт админа."""
+    return await pool.fetch("""
+        SELECT users.user_id, users.last_reminder_msg
         FROM users
         LEFT JOIN reminder_pauses
             ON reminder_pauses.user_id = users.user_id
             AND reminder_pauses.paused_until > NOW()
         WHERE reminder_pauses.user_id IS NULL
-    """)
-    return [row['user_id'] for row in rows]
+            AND users.pill_reminders
+            AND users.photo_pending_day IS DISTINCT FROM $1
+            AND NOT EXISTS (
+                SELECT 1 FROM history WHERE history.user_id = users.user_id AND history.date = $1
+            )
+    """, pill_day())
 
 async def pause_reminders(user_id):
     """Отключает напоминания на семь суток и возвращает дату их включения."""
@@ -237,18 +262,23 @@ async def resume_reminders(user_id):
     """, user_id)
     return result == "DELETE 1"
 
-async def mark_completed(user_id):
-    """Записываем, что юзер выпил таблетку сегодня"""
+async def mark_completed(user_id, day=None):
+    """Записываем, что юзер выпил таблетку в этот день приёма"""
     await pool.execute("""
-        INSERT INTO history (user_id, date) VALUES ($1, CURRENT_DATE)
+        INSERT INTO history (user_id, date) VALUES ($1, $2)
         ON CONFLICT (user_id, date) DO NOTHING
-    """, user_id)
+    """, user_id, day or pill_day())
+    await pool.execute("UPDATE users SET photo_pending_day = NULL WHERE user_id = $1", user_id)
+
+async def set_photo_pending(user_id, day):
+    """Фото ждёт админа: до его решения больше не напоминаем. None — снова напоминаем."""
+    await pool.execute("UPDATE users SET photo_pending_day = $2 WHERE user_id = $1", user_id, day)
 
 async def check_completed(user_id):
     """Проверяем, пил ли сегодня"""
     row = await pool.fetchrow("""
-        SELECT 1 FROM history WHERE user_id = $1 AND date = CURRENT_DATE
-    """, user_id)
+        SELECT 1 FROM history WHERE user_id = $1 AND date = $2
+    """, user_id, pill_day())
     return row is not None
 
 def format_pause_until(paused_until):
@@ -340,7 +370,9 @@ def user_card_keyboard(user, has_today_text=False):
         text_row.append(
             InlineKeyboardButton(text="↩️ Обычный текст", callback_data=f"adm_textreset_{user_id}")
         )
+    pill_text = "💊 Таблетки: вкл ✅" if user.get('pill_reminders', True) else "💊 Таблетки: выкл"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=pill_text, callback_data=f"adm_pill_{user_id}")],
         [InlineKeyboardButton(text=study_text, callback_data=f"adm_study_{user_id}")],
         text_row,
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_del_{user_id}")],
@@ -366,7 +398,12 @@ def users_list_text(users):
 
 async def user_card_text(user, today_text=None):
     paused_until = await get_pause_until(user['user_id'])
-    pause = f"отложены до {format_pause_until(paused_until)}" if paused_until else "включены"
+    if not user.get('pill_reminders', True):
+        pause = "выключены"
+    elif paused_until:
+        pause = f"отложены до {format_pause_until(paused_until)}"
+    else:
+        pause = "включены"
     took = "да ✅" if await check_completed(user['user_id']) else "нет"
     return (
         f"👤 {user_title(user)}\n"
@@ -443,6 +480,18 @@ async def admin_toggle_study(callback: types.CallbackQuery):
 
     await edit_user_card(callback.message, user)
     await callback.answer("Учёба включена" if enabled else "Учёба выключена")
+
+@dp.callback_query(F.data.startswith("adm_pill_"), F.from_user.id == ADMIN_ID)
+async def admin_toggle_pills(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    enabled = await toggle_pill_reminders(user_id)
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Пользователь уже удалён")
+        return
+
+    await edit_user_card(callback.message, user)
+    await callback.answer("Таблетки включены" if enabled else "Таблетки выключены")
 
 @dp.callback_query(F.data.startswith("adm_text_"), F.from_user.id == ADMIN_ID)
 async def admin_text_request(callback: types.CallbackQuery, state: FSMContext):
@@ -576,6 +625,17 @@ async def pause_cancel(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "pause_confirm_7")
 async def pause_confirm(callback: types.CallbackQuery):
+    # старая кнопка не должна продлевать уже включённую отсрочку
+    paused_until = await get_pause_until(callback.from_user.id)
+    if paused_until:
+        if callback.message:
+            await callback.message.edit_text(
+                f"⏸ Напоминания уже отложены до {format_pause_until(paused_until)}.",
+                reply_markup=resume_keyboard()
+            )
+        await callback.answer("Отсрочка уже включена")
+        return
+
     paused_until = await pause_reminders(callback.from_user.id)
     if callback.message:
         await callback.message.edit_text(
@@ -605,12 +665,15 @@ async def handle_photo(message: types.Message):
         await message.answer("Ты уже отчитался сегодня! 💊")
         return
 
+    day = pill_day()
+    await set_photo_pending(user_id, day)
     await message.answer("📸 Фото принято! Ждем админа...")
     
+    # день приёма в кнопке: подтверждение на следующий день засчитается за нужный вечер
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_{user_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_{user_id}_{day:%Y%m%d}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{day:%Y%m%d}")
         ]
     ])
     await bot.send_photo(
@@ -620,25 +683,34 @@ async def handle_photo(message: types.Message):
         reply_markup=keyboard
     )
 
+def parse_report_callback(data):
+    """«approve_123_20261109» → (123, дата). У старых кнопок даты нет — берём текущий день."""
+    parts = data.split("_")
+    day = datetime.strptime(parts[2], "%Y%m%d").date() if len(parts) > 2 else pill_day()
+    return int(parts[1]), day
+
 @dp.callback_query(F.data.startswith("approve_"), F.from_user.id == ADMIN_ID)
 async def admin_approve(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[1])
-    
-    await mark_completed(user_id)
-    
+    user_id, day = parse_report_callback(callback.data)
+
+    await mark_completed(user_id, day)
+
     try:
         await bot.send_message(user_id, "✅ Админ подтвердил! Напоминания отключены.")
-    except: pass
+    except Exception:
+        logging.exception("Не удалось сообщить о подтверждении")
 
     await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n✅ ПОДТВЕРЖДЕНО")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("reject_"), F.from_user.id == ADMIN_ID)
 async def admin_reject(callback: types.CallbackQuery):
-    user_id = int(callback.data.split("_")[1])
+    user_id, _ = parse_report_callback(callback.data)
+    await set_photo_pending(user_id, None)
     try:
         await bot.send_message(user_id, "❌ Отчет отклонен. Пришли нормальное фото!")
-    except: pass
+    except Exception:
+        logging.exception("Не удалось сообщить об отклонении")
     await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n❌ ОТКЛОНЕНО")
     await callback.answer()
 
@@ -722,6 +794,22 @@ async def send_own_reminders():
         else:
             await pool.execute("DELETE FROM user_reminders WHERE id = $1", reminder['id'])
 
+@dp.callback_query()
+async def stale_button(callback: types.CallbackQuery):
+    """Кнопки, которых бот не знает (например, от старой версии): без ответа они «висят»."""
+    await callback.answer("Эта кнопка устарела")
+
+@dp.errors()
+async def on_error(event: ErrorEvent):
+    """Ошибка в обработчике не должна оставлять кнопку «висеть»."""
+    logging.exception("Ошибка при обработке обновления", exc_info=event.exception)
+    if event.update.callback_query:
+        try:
+            await event.update.callback_query.answer()
+        except Exception:
+            pass
+    return True
+
 # --- ПЛАНИРОВЩИК ---
 
 async def study_reminder():
@@ -732,32 +820,40 @@ async def study_reminder():
         except Exception:
             logging.exception("Не удалось отправить напоминание об учёбе")
 
-async def morning_reminder():
-    users = await get_users_for_reminders()
-    for user_id in users:
+async def send_pill_reminder(user, default_text):
+    """Шлёт напоминание и убирает предыдущее, чтобы в чате не копилась пачка одинаковых."""
+    user_id = user['user_id']
+    try:
+        sent = await bot.send_message(
+            user_id,
+            await get_today_text(user_id) or default_text,
+            reply_markup=reminder_keyboard()
+        )
+    except Exception:
+        logging.exception("Не удалось отправить напоминание о таблетке")
+        return
+
+    previous = user.get('last_reminder_msg')
+    if previous:
         try:
-            await bot.send_message(
-                user_id,
-                await get_today_text(user_id) or PILL_REMINDER_TEXT,
-                reply_markup=reminder_keyboard()
-            )
-        except: pass
+            await bot.delete_message(user_id, previous)
+        except Exception:
+            pass  # сообщение уже удалено или старше 48 часов
+    await pool.execute(
+        "UPDATE users SET last_reminder_msg = $2 WHERE user_id = $1", user_id, sent.message_id
+    )
+
+async def morning_reminder():
+    for user in await get_users_for_reminders():
+        await send_pill_reminder(user, PILL_REMINDER_TEXT)
 
 async def nagging_check():
     now = datetime.now(LOCAL_TIMEZONE)
     # Напоминаем с 22:00 до 01:00 по Калининграду.
     if not (now.hour >= 22 or now.hour < 1): return
 
-    users = await get_users_for_reminders()
-    for user_id in users:
-        if not await check_completed(user_id):
-            try:
-                await bot.send_message(
-                    user_id,
-                    await get_today_text(user_id) or NAGGING_TEXT,
-                    reply_markup=reminder_keyboard()
-                )
-            except: pass
+    for user in await get_users_for_reminders():
+        await send_pill_reminder(user, NAGGING_TEXT)
 
 # --- ЗАПУСК ---
 async def main():
@@ -777,7 +873,8 @@ async def main():
     
     scheduler.start()
     
-    await bot.delete_webhook(drop_pending_updates=True)
+    # сообщения, пришедшие во время перезапуска, не теряем
+    await bot.delete_webhook(drop_pending_updates=False)
     await bot.set_my_commands([
         types.BotCommand(command="reminders", description="Мои напоминания"),
         types.BotCommand(command="resume", description="Отменить отсрочку таблеток"),

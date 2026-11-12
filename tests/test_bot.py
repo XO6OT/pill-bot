@@ -1,6 +1,7 @@
 import unittest
 from datetime import date, datetime, time
-from unittest.mock import AsyncMock, patch
+from io import BytesIO
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
 
@@ -125,6 +126,59 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         message = main.version_message(local(15, 30))
         self.assertIn(main.APP_VERSION, message)
         self.assertIn("12.11.2026 в 15:30", message)
+
+
+    def voice_message(self, duration=5):
+        message = MagicMock()
+        message.voice.duration = duration
+        message.audio = None
+        message.from_user.id = 7
+        message.chat.id = 7
+        message.answer = AsyncMock()
+        return message
+
+    async def run_voice(self, message, key="test-key", heard=None):
+        with patch.object(main, "GROQ_API_KEY", key), \
+                patch.object(main.bot, "send_chat_action", new_callable=AsyncMock), \
+                patch.object(main.bot, "download", new=AsyncMock(return_value=BytesIO(b"ogg"))), \
+                patch.object(main, "transcribe", new=AsyncMock(return_value=heard)):
+            await main.handle_voice(message)
+        return message.answer.await_args.args[0]
+
+    async def test_voice_without_key_says_not_set(self):
+        reply = await self.run_voice(self.voice_message(), key=None)
+        self.assertIn("напоминание не поставлено", reply)
+        self.assertIn("текстом", reply)
+
+    async def test_voice_recognized_sets_reminder(self):
+        main.pool.fetchval.side_effect = [0, 42]  # напоминаний у неё ещё нет, новое получило id 42
+        message = self.voice_message()
+
+        reply = await self.run_voice(message, heard="Напомни мне через 5 минут достать бельё")
+
+        self.assertIn("🎤 Распознано: «Напомни мне через 5 минут достать бельё»", reply)
+        self.assertIn("✅ Напоминание поставлено", reply)
+        self.assertIn("Достать бельё", reply)
+        button = message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.callback_data, "rem_del_42")
+
+    async def test_voice_recognized_but_no_time(self):
+        reply = await self.run_voice(self.voice_message(), heard="Напомни достать бельё")
+        self.assertIn("🎤 Распознано", reply)
+        self.assertIn("❌ Напоминание не поставлено", reply)
+
+    async def test_voice_without_request_to_remind(self):
+        reply = await self.run_voice(self.voice_message(), heard="Привет, как дела")
+        self.assertIn("🎤 Распознано: «Привет, как дела»", reply)
+        self.assertIn("не нашёл просьбы напомнить", reply)
+
+    async def test_voice_not_recognized(self):
+        reply = await self.run_voice(self.voice_message(), heard=None)
+        self.assertIn("Не получилось разобрать голосовое", reply)
+
+    async def test_voice_too_long(self):
+        reply = await self.run_voice(self.voice_message(duration=300), heard="что угодно")
+        self.assertIn("слишком длинное", reply)
 
 
 if __name__ == "__main__":

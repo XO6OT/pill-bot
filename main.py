@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import aiohttp
 import asyncpg
 import pytz
 from datetime import datetime, time, timedelta
@@ -21,8 +22,8 @@ from reminder_parser import (
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = 565936264
-APP_VERSION = "2026.11.12-admin-notifications"
-UPDATE_DESCRIPTION = "таблетки убраны; свои уведомления в /notify; фото можно прислать и запросить"
+APP_VERSION = "2026.11.12-voice"
+UPDATE_DESCRIPTION = "бот всегда отвечает на голосовые; распознаёт их, если задан GROQ_API_KEY"
 
 # Список пользователей, которые ДОЛЖНЫ быть в базе всегда
 PRELOAD_USERS = [565936264, 8530310460, 907912564]
@@ -35,6 +36,10 @@ scheduler = AsyncIOScheduler()
 pool = None  # Тут будет соединение с базой
 LOCAL_TIMEZONE = pytz.timezone("Europe/Kaliningrad")
 PHOTO_REQUEST_TEXT = "📸 Пришли, пожалуйста, фото ❤️"
+# Ключ бесплатного распознавания речи Groq (console.groq.com). Без него голосовые не распознаются.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+MAX_VOICE_SECONDS = 120
 # опоздавшее уведомление (бот перезапускался) ещё отправляем, позже — уже нет
 NOTIFICATION_GRACE = timedelta(hours=1)
 
@@ -710,27 +715,95 @@ OWN_REMINDERS_HELP = (
     + "\nСписок и удаление: /reminders"
 )
 
-@dp.message(F.text, ~F.text.startswith("/"), F.text.func(looks_like_reminder))
-async def own_reminder_create(message: types.Message):
+async def create_reminder_from_text(message: types.Message, text, heard=""):
+    """Ставит напоминание по фразе и всегда отвечает: поставлено или почему нет.
+    heard — строка «🎤 Распознано: …» для голосовых."""
     try:
-        parsed = parse_reminder(message.text, datetime.now(LOCAL_TIMEZONE))
+        parsed = parse_reminder(text, datetime.now(LOCAL_TIMEZONE))
     except ReminderError as error:
-        await message.answer(str(error))
+        await message.answer(heard + "❌ Напоминание не поставлено.\n" + str(error))
         return
 
     reminder_id = await add_own_reminder(message.from_user.id, parsed)
     if reminder_id is None:
         await message.answer(
-            f"У тебя уже {MAX_OWN_REMINDERS} напоминаний. Удали ненужные в /reminders."
+            heard + f"❌ У тебя уже {MAX_OWN_REMINDERS} напоминаний. Удали ненужные в /reminders."
         )
         return
 
     await message.answer(
-        with_reminder_text(f"✅ Напомню {format_remind_at(parsed.remind_at, parsed.repeat_days)}", parsed.text),
+        heard + with_reminder_text(
+            f"✅ Напоминание поставлено: {format_remind_at(parsed.remind_at, parsed.repeat_days)}", parsed.text
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отменить", callback_data=f"rem_del_{reminder_id}")]
         ])
     )
+
+@dp.message(F.text, ~F.text.startswith("/"), F.text.func(looks_like_reminder))
+async def own_reminder_create(message: types.Message):
+    await create_reminder_from_text(message, message.text)
+
+async def transcribe(audio_bytes, filename):
+    """Текст голосового через Groq Whisper или None, если не получилось."""
+    form = aiohttp.FormData()
+    form.add_field("file", audio_bytes, filename=filename)
+    form.add_field("model", "whisper-large-v3-turbo")
+    form.add_field("language", "ru")
+    form.add_field("response_format", "json")
+    timeout = aiohttp.ClientTimeout(total=60)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                GROQ_TRANSCRIBE_URL, data=form, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}
+            ) as response:
+                if response.status != 200:
+                    logging.error("Groq ответил %s: %s", response.status, (await response.text())[:300])
+                    return None
+                return ((await response.json()).get("text") or "").strip() or None
+    except Exception:
+        logging.exception("Не удалось распознать голосовое")
+        return None
+
+VOICE_EXAMPLE = "Например: «Напомни через 5 минут достать бельё»."
+
+@dp.message(F.voice | F.audio)
+async def handle_voice(message: types.Message):
+    """На голосовое бот отвечает всегда: поставил напоминание или почему не смог."""
+    if not GROQ_API_KEY:
+        await message.answer(
+            "🎤 Голосовые я пока не умею распознавать, напоминание не поставлено.\n"
+            "Напиши, пожалуйста, текстом. " + VOICE_EXAMPLE
+        )
+        return
+
+    audio = message.voice or message.audio
+    if (audio.duration or 0) > MAX_VOICE_SECONDS:
+        await message.answer("🎤 Голосовое слишком длинное, напоминание не поставлено. Скажи покороче. " + VOICE_EXAMPLE)
+        return
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        data = await bot.download(audio)
+        text = await transcribe(data.read(), "voice.ogg" if message.voice else (audio.file_name or "audio.mp3"))
+    except Exception:
+        logging.exception("Не удалось скачать голосовое")
+        text = None
+
+    if not text:
+        await message.answer(
+            "🎤 Не получилось разобрать голосовое, напоминание не поставлено 🙈\n"
+            "Попробуй ещё раз или напиши текстом. " + VOICE_EXAMPLE
+        )
+        return
+
+    heard = f"🎤 Распознано: «{text}»\n"
+    if not looks_like_reminder(text):
+        await message.answer(
+            heard + "❌ Напоминание не поставлено: не нашёл просьбы напомнить. " + VOICE_EXAMPLE
+        )
+        return
+    await create_reminder_from_text(message, text, heard)
 
 @dp.message(Command("reminders"))
 async def cmd_reminders(message: types.Message):
